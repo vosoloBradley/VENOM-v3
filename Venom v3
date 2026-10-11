@@ -1,0 +1,1156 @@
+//+------------------------------------------------------------------+
+//|                        GORO Zetu ZetuHFT.mq5                       |
+//|              High Frequency Gold Straddle Algorithm              |
+//|         Buy Stop + Sell Stop | Trail SL | Auto-Restart           |
+//+------------------------------------------------------------------+
+#property copyright   "GORO Zetu ZetuHFT"
+#property version     "1.00"
+#property description "Places simultaneous Buy Stop & Sell Stop 30 pips from market price."
+#property description "Trails SL at 10 pips once activated. Restarts on TP/SL hit."
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\OrderInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//+------------------------------------------------------------------+
+//|  INPUT PARAMETERS                                                |
+//+------------------------------------------------------------------+
+input double   InpLotSize          = 0.10;   // Lot Size
+input int      InpEntryPips        = 30;     // Entry Distance (pips above/below price)
+input int      InpStopLossPips     = 60;     // Initial Stop Loss (pips)
+input int      InpTakeProfitPips   = 80;     // Take Profit (pips from entry)
+input int      InpTrailStepPips    = 10;     // Trail Step (pips) — kicks in after SL snaps to 10 pips
+input color    InpBuyColor         = clrDodgerBlue;  // Buy Order Label Color
+input color    InpSellColor        = clrTomato;      // Sell Order Label Color
+input bool     InpAutoStart        = true;           // Auto-Start (set true for Strategy Tester)
+input bool     InpVerboseLogging   = false;           // Verbose Debug Logging (OFF = faster execution)
+
+//--- Risk Management
+input double   InpDailyLossLimit   = 10.0;  // Daily Loss Limit (% of balance)
+input double   InpDailyProfitTarget= 30.0;  // Daily Profit Target (% of balance)
+
+//--- Volume & Ranging Filters
+//    All filters only gate order placement — never block trailing SL or active trade mgmt.
+//    InpFiltersEnabled is the master switch: false = skip ALL filters, place any conditions.
+input string   InpFilter_Sep           = "━━━━ MARKET FILTERS ━━━━";   // ───────────────────
+input bool     InpFiltersEnabled       = true;   // ► MASTER FILTER SWITCH (false = disable all)
+input bool     InpUseATRFilter         = true;   // ATR Volatility Filter ON/OFF
+input int      InpATRPeriod            = 14;     // ATR Period (bars)
+input double   InpMinATRPips           = 15.0;   // Min ATR (pips) — below = low vol / ranging
+input bool     InpUseADXFilter         = true;   // ADX Trend-Strength Filter ON/OFF
+input int      InpADXPeriod            = 14;     // ADX Period (bars)
+input double   InpMinADX               = 20.0;   // Min ADX — below = ranging / no trend
+//--- Session Time Filter
+//    Enable the sessions you want to trade. Disabled sessions are blocked entirely.
+//    All times are SERVER time (check bottom-right clock in MT5).
+input bool     InpUseSessionFilter     = true;   // Session Filter ON/OFF
+input bool     InpTradeAsia            = false;  // Trade Asian Session
+input int      InpAsiaStart            = 0;      // Asia Start Hour (server time)
+input int      InpAsiaEnd              = 7;      // Asia End Hour   (server time)
+input bool     InpTradeLondon          = true;   // Trade London Session
+input int      InpLondonStart          = 7;      // London Start Hour (server time)
+input int      InpLondonEnd            = 16;     // London End Hour   (server time)
+input bool     InpTradeNewYork         = true;   // Trade New York Session
+input int      InpNYStart              = 13;     // NY Start Hour (server time)
+input int      InpNYEnd                = 22;     // NY End Hour   (server time)
+
+//--- License
+input string   InpLicenseKey       = "";    // License Key (provided on activation)
+
+//+------------------------------------------------------------------+
+//|  GLOBAL VARIABLES                                                |
+//+------------------------------------------------------------------+
+CTrade         Trade;
+COrderInfo     OrderInfo;
+CPositionInfo  PositionInfo;
+
+// Magic number to tag this EA's orders
+const long     MAGIC_NUMBER = 20240601;
+
+// Algorithm run state (controlled by dashboard buttons)
+bool           g_AlgoRunning   = false;
+
+// Ticket tracking
+ulong          g_BuyStopTicket  = 0;
+ulong          g_SellStopTicket = 0;
+
+// Cycle state machine
+enum CYCLE_STATE
+  {
+   STATE_IDLE,           // Waiting for algo start
+   STATE_PENDING,        // Both pending orders placed, waiting for activation
+   STATE_TRADE_ACTIVE,   // One trade is live, trailing SL
+   STATE_CYCLE_DONE      // Trade closed (TP/SL), ready to restart
+  };
+
+CYCLE_STATE    g_CycleState = STATE_IDLE;
+
+// Dashboard button object names
+const string   BTN_START = "BTN_START";
+const string   BTN_STOP  = "BTN_STOP";
+const string   LBL_STATUS = "LBL_STATUS";
+const string   LBL_INFO   = "LBL_INFO";
+
+// Pip value for XAUUSD (Gold) — 1 pip = 0.1 price units (10 cents)
+double         g_PipSize = 0.0;
+
+//--- Cached symbol/derived values (computed once in OnInit)
+string         g_Symbol          = "";     // Cached Symbol() — avoids string alloc per call
+int            g_Digits          = 2;
+double         g_TrailStep       = 0.0;
+double         g_SnapDistance    = 0.0;
+
+//--- Per-tick price/time cache (set ONCE at top of OnTick, reused by all sub-functions)
+//    Eliminates redundant SymbolInfoDouble + TimeCurrent/TimeToStruct calls across
+//    TrailStopLoss, PlaceStraddleOrders, IsMarketTradeable, etc.
+double         g_Bid             = 0.0;
+double         g_Ask             = 0.0;
+int            g_CurrentHour     = -1;    // Server time hour (0-23), refreshed each tick
+
+//--- Session bitmask: bit N set = hour N is an allowed trading hour.
+//    Built once in OnInit. Per-tick session check = single bit-shift op, zero branching.
+uint           g_SessionMask     = 0xFFFFFF;   // All hours allowed until OnInit sets it
+
+//--- Active position ticket cache: when trade activates, store its ticket here.
+//    TrailStopLoss then uses SelectByTicket() (O(1)) instead of SelectByMagic() (O(n) scan).
+ulong          g_ActivePositionTicket = 0;
+
+//--- Dashboard redraw throttle
+uint           g_LastRedrawMs    = 0;
+
+//--- Risk Management globals
+double         g_DayStartBalance   = 0.0;   // Balance at start of trading day
+datetime       g_LastDayChecked    = 0;     // Last day risk was reset
+bool           g_RiskLimitHit      = false; // Flag: daily limit reached, algo paused
+
+//--- Timeframe-lock globals
+datetime       g_LastBarTime       = 0;     // Time of the last processed bar open
+bool           g_NewBarOccurred    = false; // Flag: a new bar just opened
+
+//--- License globals
+bool           g_LicenseValid      = false; // Set true after successful validation
+long           g_BoundAccount      = 0;     // Account number this license is bound to
+
+//--- Volume & Ranging Filter globals
+int            g_ATRHandle         = INVALID_HANDLE;  // ATR indicator handle (cached)
+int            g_ADXHandle         = INVALID_HANDLE;  // ADX indicator handle (cached)
+string         g_FilterBlockReason = "";               // Last reason a filter blocked (for dashboard)
+
+//--- Filter value cache — ATR and ADX read bar[1] (last CLOSED bar) so their values
+//    only change once per bar open. Caching avoids redundant CopyBuffer calls on
+//    every tick in IDLE state, which can be dozens of calls per second on gold.
+bool           g_FilterCacheValid  = false;   // True once first bar has been evaluated
+bool           g_FilterPassCache   = false;   // Last computed filter result
+double         g_CachedATRPips     = 0.0;     // Last ATR reading in pips (for dashboard)
+double         g_CachedADX         = 0.0;     // Last ADX reading (for dashboard)
+
+//+------------------------------------------------------------------+
+//|  LICENSE: Generate a deterministic key from account number       |
+//|  Key format: "GORO-<encoded>-HFT" derived from account number    |
+//+------------------------------------------------------------------+
+string GenerateExpectedKey(long accountNumber)
+  {
+   //--- Simple but non-obvious encoding: XOR + base-36 style string
+   long   seed    = accountNumber ^ 0xA5F3C27B;
+   long   part1   = (seed & 0xFFFF);
+   long   part2   = ((seed >> 16) & 0xFFFF);
+   long   part3   = ((seed >> 32) & 0xFFFF);
+   return StringFormat("GORO-%04X-%04X-%04X-HFT", part1, part2, part3);
+  }
+
+//+------------------------------------------------------------------+
+//|  LICENSE: Validate the entered key against this account          |
+//+------------------------------------------------------------------+
+bool ValidateLicense()
+  {
+   long   account = AccountInfoInteger(ACCOUNT_LOGIN);
+   string expected = GenerateExpectedKey(account);
+
+   if(InpLicenseKey != expected)
+     {
+      Alert("⛔ VENOM AI — License Invalid!\n"
+            "This EA is not activated for account #", account, ".\n"
+            "Contact the provider to obtain your key.");
+      Print("License check FAILED. Account: ", account,
+            " | Expected key: ", expected,
+            " | Entered key: ", InpLicenseKey);
+      return false;
+     }
+
+   g_BoundAccount = account;
+   if(InpVerboseLogging)
+      Print("License validated for account #", account);
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//|  RISK: Reset daily balance snapshot at start of each new day     |
+//+------------------------------------------------------------------+
+void CheckAndResetDailyRisk()
+  {
+   MqlDateTime now;
+   TimeToStruct(TimeCurrent(), now);
+
+   MqlDateTime lastDay;
+   TimeToStruct(g_LastDayChecked, lastDay);
+
+   //--- New trading day detected
+   if(now.day != lastDay.day || now.mon != lastDay.mon || now.year != lastDay.year)
+     {
+      g_DayStartBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
+      g_LastDayChecked   = TimeCurrent();
+      g_RiskLimitHit     = false;   // Reset the daily lock for the new day
+
+      Print("New trading day. Balance snapshot: $", DoubleToString(g_DayStartBalance, 2));
+
+      //--- If algo was paused by risk limits, restart it for the new day
+      if(!g_AlgoRunning)
+        {
+         g_AlgoRunning = true;
+         g_CycleState  = STATE_IDLE;
+         UpdateDashboardStatus("RUNNING", clrLimeGreen);
+         Print("New day — algo restarted automatically after daily risk reset.");
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|  RISK: Check daily P&L against configured limits                 |
+//|  Stops algo if daily loss or profit target has been reached      |
+//+------------------------------------------------------------------+
+void CheckDailyRiskLimits()
+  {
+   if(g_RiskLimitHit)
+      return;   // Already stopped for today — nothing more to do
+
+   if(g_DayStartBalance <= 0)
+      return;   // Safety: snapshot not yet taken
+
+   double equity      = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dailyPnL    = equity - g_DayStartBalance;
+   double pnlPct      = (dailyPnL / g_DayStartBalance) * 100.0;
+
+   //--- Daily loss limit breached
+   if(pnlPct <= -(InpDailyLossLimit))
+     {
+      g_RiskLimitHit = true;
+      StopAlgorithm();
+      Alert("⛔ Daily loss limit hit! P&L: ", DoubleToString(pnlPct, 2),
+            "% (Limit: -", DoubleToString(InpDailyLossLimit, 2), "%). Algo paused until tomorrow.");
+      Print("RISK STOP — Daily loss limit hit. P&L%: ", pnlPct);
+      UpdateDashboardStatus("RISK: LOSS LIMIT", clrOrangeRed);
+      return;
+     }
+
+   //--- Daily profit target reached
+   if(pnlPct >= InpDailyProfitTarget)
+     {
+      g_RiskLimitHit = true;
+      StopAlgorithm();
+      Alert("✅ Daily profit target reached! P&L: +", DoubleToString(pnlPct, 2),
+            "% (Target: +", DoubleToString(InpDailyProfitTarget, 2), "%). Algo paused until tomorrow.");
+      Print("RISK STOP — Daily profit target hit. P&L%: ", pnlPct);
+      UpdateDashboardStatus("RISK: PROFIT TARGET", clrGold);
+      return;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|  TIMEFRAME LOCK: Detect if a new bar has opened this tick        |
+//|  Returns true only on the very first tick of a new bar           |
+//+------------------------------------------------------------------+
+bool IsNewBarOpen()
+  {
+   datetime currentBarTime = (datetime)SeriesInfoInteger(g_Symbol, Period(), SERIES_LASTBAR_DATE);
+   if(currentBarTime != g_LastBarTime)
+     {
+      g_LastBarTime = currentBarTime;
+      return true;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//|  HELPER: Auto-detect the correct order filling mode for broker   |
+//|  FIX: FOK checked first — most universally accepted on live      |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING GetFillingMode()
+  {
+   //--- Read what filling modes the broker supports for this symbol
+   //    SYMBOL_FILLING_MODE returns a bitmask: bit 0 = FOK, bit 1 = IOC
+   uint filling = (uint)SymbolInfoInteger(g_Symbol, SYMBOL_FILLING_MODE);
+
+   //--- FOK is checked first: most universally accepted on live ECN/STP accounts
+   //    Previously IOC was checked first, causing silent order rejections on live
+   if((filling & SYMBOL_FILLING_FOK) != 0)
+      return ORDER_FILLING_FOK;   // Fill Or Kill (preferred for live accounts)
+   if((filling & SYMBOL_FILLING_IOC) != 0)
+      return ORDER_FILLING_IOC;   // Immediate Or Cancel
+   return ORDER_FILLING_RETURN;   // Return remainder (ECN/STP fallback)
+  }
+
+//+------------------------------------------------------------------+
+//|  STATE RECOVERY: Detect existing positions/pending orders        |
+//|  on EA reload (timeframe switch, recompile, chart reload, etc.)  |
+//|  Prevents placing a duplicate straddle when one is already live  |
+//+------------------------------------------------------------------+
+void RecoverExistingState()
+  {
+   bool buyActive  = PositionExistsByMagic(POSITION_TYPE_BUY);
+   bool sellActive = PositionExistsByMagic(POSITION_TYPE_SELL);
+
+   if(buyActive || sellActive)
+     {
+      g_CycleState = STATE_TRADE_ACTIVE;
+      if(InpVerboseLogging)
+         Print("Reload detected — existing position found. Resuming TRADE_ACTIVE (no new orders placed).");
+      return;
+     }
+
+   //--- No live position — check for this EA's pending stop orders
+   ulong buyTicket = 0, sellTicket = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(OrderInfo.SelectByIndex(i))
+        {
+         if(OrderInfo.Symbol() == g_Symbol && OrderInfo.Magic() == MAGIC_NUMBER)
+           {
+            if(OrderInfo.OrderType() == ORDER_TYPE_BUY_STOP)
+               buyTicket = OrderInfo.Ticket();
+            else if(OrderInfo.OrderType() == ORDER_TYPE_SELL_STOP)
+               sellTicket = OrderInfo.Ticket();
+           }
+        }
+     }
+
+   if(buyTicket > 0 || sellTicket > 0)
+     {
+      g_BuyStopTicket  = buyTicket;
+      g_SellStopTicket = sellTicket;
+      g_CycleState     = STATE_PENDING;
+      if(InpVerboseLogging)
+         Print("Reload detected — existing pending order(s) found. Resuming PENDING (no new orders placed). Buy:",
+               buyTicket, " Sell:", sellTicket);
+      return;
+     }
+
+   //--- Nothing live or pending — safe to start a fresh cycle
+   g_CycleState = STATE_IDLE;
+  }
+
+//+------------------------------------------------------------------+
+//|  SESSION BITMASK BUILDER                                         |
+//|  Sets bit N in g_SessionMask for every hour N that belongs to   |
+//|  an enabled session. Called once in OnInit.                      |
+//|  Per-tick session check: (g_SessionMask >> g_CurrentHour) & 1   |
+//+------------------------------------------------------------------+
+void SetMaskHours(uint &mask, int startH, int endH)
+  {
+   //--- Handles both normal ranges (07-16) and overnight wraps (22-06)
+   for(int h = 0; h < 24; h++)
+     {
+      bool inRange = (startH <= endH)
+                     ? (h >= startH && h < endH)
+                     : (h >= startH || h < endH);
+      if(inRange)
+         mask |= (1u << h);
+     }
+  }
+
+void BuildSessionMask()
+  {
+   if(!InpUseSessionFilter)
+     {
+      g_SessionMask = 0xFFFFFF;   // All 24 hours open
+      return;
+     }
+   g_SessionMask = 0;
+   if(InpTradeAsia)    SetMaskHours(g_SessionMask, InpAsiaStart,   InpAsiaEnd);
+   if(InpTradeLondon)  SetMaskHours(g_SessionMask, InpLondonStart, InpLondonEnd);
+   if(InpTradeNewYork) SetMaskHours(g_SessionMask, InpNYStart,     InpNYEnd);
+   //--- Failsafe: if all sessions disabled but filter is on, allow all (misconfiguration guard)
+   if(g_SessionMask == 0)
+     {
+      g_SessionMask = 0xFFFFFF;
+      Print("Warning: Session filter ON but no sessions selected — allowing all hours.");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|  EXPERT INITIALIZATION                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   //--- License check: must pass before anything else runs
+   if(!MQLInfoInteger(MQL_TESTER) && !ValidateLicense())
+      return(INIT_FAILED);
+
+   //--- Validate symbol
+   if(StringFind(g_Symbol, "XAU") < 0 && StringFind(g_Symbol, "GOLD") < 0)
+      Alert("Warning: This EA is optimized for XAUUSD (Gold). Proceed with caution.");
+
+   //--- Configure trade object
+   Trade.SetExpertMagicNumber(MAGIC_NUMBER);
+   Trade.SetDeviationInPoints(10);
+
+   //--- Auto-detect broker filling mode
+   uint rawFilling = (uint)SymbolInfoInteger(g_Symbol, SYMBOL_FILLING_MODE);
+   ENUM_ORDER_TYPE_FILLING fillMode = GetFillingMode();
+   Trade.SetTypeFilling(fillMode);
+   if(InpVerboseLogging)
+      Print("Filling mode bitmask: ", rawFilling, " → Selected: ", EnumToString(fillMode));
+
+   //--- Cache symbol string once — avoids repeated string allocation on every call
+   g_Symbol = Symbol();
+
+   //--- Determine pip size based on symbol digits
+   //    XAUUSD: 2 decimal places → 1 pip = $0.10 | 3 dp → 0.001
+   int digits = (int)SymbolInfoInteger(g_Symbol, SYMBOL_DIGITS);
+   g_PipSize  = (digits == 2) ? 0.10 : (digits == 3) ? 0.001 : 0.0001;
+
+   //--- Cache digits + trail distances + threshold once
+   g_Digits         = digits;
+   g_TrailStep      = InpTrailStepPips * g_PipSize;
+   g_SnapDistance   = 10.0             * g_PipSize;
+
+   //--- Build session bitmask: bit N = hour N is an allowed trading hour.
+   //    Per-tick check is then just: (g_SessionMask >> g_CurrentHour) & 1
+   //    Zero branching, zero string ops, runs in a single CPU instruction.
+   BuildSessionMask();
+
+   if(InpVerboseLogging)
+      Print("GoldStraddleHFT initialized | PipSize=", g_PipSize,
+            " | Digits=", digits, " | Magic=", MAGIC_NUMBER);
+
+   //--- Build dashboard UI (safe to call in tester — objects just won't be clickable)
+   BuildDashboard();
+
+   //--- Initialise daily risk snapshot
+   g_DayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_LastDayChecked  = TimeCurrent();
+   Print("Daily risk snapshot set. Balance: $", DoubleToString(g_DayStartBalance, 2),
+         " | Loss limit: ", InpDailyLossLimit, "% | Profit target: ", InpDailyProfitTarget, "%");
+
+   //--- Initialise timeframe-lock bar tracker
+   g_LastBarTime = (datetime)SeriesInfoInteger(g_Symbol, Period(), SERIES_LASTBAR_DATE);
+
+   //--- Initialise market filter indicator handles (cached — only created once)
+   if(InpUseATRFilter)
+     {
+      g_ATRHandle = iATR(g_Symbol, Period(), InpATRPeriod);
+      if(g_ATRHandle == INVALID_HANDLE)
+         Print("Warning: Failed to create ATR indicator handle.");
+     }
+   if(InpUseADXFilter)
+     {
+      g_ADXHandle = iADX(g_Symbol, Period(), InpADXPeriod);
+      if(g_ADXHandle == INVALID_HANDLE)
+         Print("Warning: Failed to create ADX indicator handle.");
+     }
+   //--- Mark cache as stale so it recalculates on the very first tick
+   g_FilterCacheValid = false;
+
+   //--- Auto-start: fires immediately when InpAutoStart=true OR running in tester.
+   //    The Strategy Tester never fires OnChartEvent, so the START button cannot
+   //    be clicked. This flag bypasses that limitation automatically.
+   if(InpAutoStart || MQLInfoInteger(MQL_TESTER))
+     {
+      g_AlgoRunning = true;
+      RecoverExistingState();   // Resume correct state instead of always starting fresh —
+                                 // prevents duplicate orders when EA reloads (e.g. timeframe switch)
+      Print("Auto-Start active — algorithm running immediately.");
+      UpdateDashboardStatus("RUNNING", clrLimeGreen);
+     }
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//|  EXPERT DEINITIALIZATION                                         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   //--- Stop algo and clean up
+   g_AlgoRunning = false;
+   RemoveDashboard();
+
+   //--- Release indicator handles to free terminal memory
+   if(g_ATRHandle != INVALID_HANDLE) { IndicatorRelease(g_ATRHandle); g_ATRHandle = INVALID_HANDLE; }
+   if(g_ADXHandle != INVALID_HANDLE) { IndicatorRelease(g_ADXHandle); g_ADXHandle = INVALID_HANDLE; }
+
+   Print("GoldStraddleHFT deinitialized. Reason code: ", reason);
+  }
+
+//+------------------------------------------------------------------+
+//|  MAIN TICK HANDLER                                               |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   //--- Cache price and time ONCE per tick — all sub-functions read these globals
+   //    instead of calling SymbolInfoDouble/TimeCurrent independently, eliminating
+   //    redundant kernel calls that add up to measurable latency on fast gold ticks.
+   g_Bid         = SymbolInfoDouble(g_Symbol, SYMBOL_BID);
+   g_Ask         = SymbolInfoDouble(g_Symbol, SYMBOL_ASK);
+   MqlDateTime _t; TimeToStruct(TimeCurrent(), _t);
+   g_CurrentHour = _t.hour;
+
+   //--- Daily risk: reset snapshot at start of each new day (runs always, even when stopped)
+   CheckAndResetDailyRisk();
+
+   //--- Only run logic when algo is active
+   if(!g_AlgoRunning)
+      return;
+
+   //--- Daily risk: check limits each tick while algo is running
+   CheckDailyRiskLimits();
+   if(!g_AlgoRunning)   // Risk check may have stopped the algo — exit immediately
+      return;
+
+   //--- Timeframe-lock: detect new bar, but do NOT place new straddle on bar open.
+   //    New orders are only placed when a cycle completes (STATE_CYCLE_DONE → STATE_IDLE).
+   //    We track it here so HandleIdleState knows if it is safe to place orders.
+   g_NewBarOccurred = IsNewBarOpen();
+
+   //--- Refresh ATR/ADX filter cache once per bar (bar[1] values never change mid-bar).
+   //    This keeps CopyBuffer calls out of the per-tick hot path entirely.
+   if(g_NewBarOccurred || !g_FilterCacheValid)
+      RecalcIndicatorCache();
+
+   //--- State machine dispatcher
+   switch(g_CycleState)
+     {
+      case STATE_IDLE:
+         HandleIdleState();
+         break;
+
+      case STATE_PENDING:
+         HandlePendingState();
+         break;
+
+      case STATE_TRADE_ACTIVE:
+         HandleActiveTradeState();
+         break;
+
+      case STATE_CYCLE_DONE:
+         HandleCycleDoneState();
+         break;
+     }
+
+   //--- Update dashboard info label (throttled — UI redraw doesn't need to run on
+   //    every single tick; gold can tick multiple times per second, and ChartRedraw
+   //    is comparatively expensive. 200ms is still visually instant for a human.)
+   uint nowMs = GetTickCount();
+   if(nowMs - g_LastRedrawMs >= 200)
+     {
+      g_LastRedrawMs = nowMs;
+      UpdateDashboardInfo();
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|  CHART EVENT HANDLER (Button Clicks)                             |
+//|  Note: OnChartEvent does NOT fire in the Strategy Tester.        |
+//|        Use InpAutoStart=true to run there instead.               |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long& lparam,
+                  const double& dparam, const string& sparam)
+  {
+   if(id == CHARTEVENT_OBJECT_CLICK)
+     {
+      //--- START button clicked (only relevant when InpAutoStart=false)
+      if(sparam == BTN_START && !g_AlgoRunning)
+        {
+         g_AlgoRunning = true;
+         RecoverExistingState();   // Don't blindly go IDLE — resume if something's already live
+         Print("Algorithm STARTED by user.");
+         UpdateDashboardStatus("RUNNING", clrLimeGreen);
+         //--- Reset button state so it doesn't stay pressed
+         ObjectSetInteger(ChartID(), BTN_START, OBJPROP_STATE, false);
+        }
+
+      //--- STOP button clicked
+      if(sparam == BTN_STOP && g_AlgoRunning)
+        {
+         StopAlgorithm();
+         ObjectSetInteger(ChartID(), BTN_STOP, OBJPROP_STATE, false);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|  FILTER CACHE: Recalculate ATR/ADX values from the last closed   |
+//|  bar. Called ONCE per new bar open (g_NewBarOccurred), not per   |
+//|  tick — CopyBuffer on every tick is the main source of lag added |
+//|  by the filter. ATR/ADX on bar[1] never change mid-bar anyway.   |
+//+------------------------------------------------------------------+
+void RecalcIndicatorCache()
+  {
+   g_FilterPassCache = true;   // Assume pass until a filter fails
+   g_FilterBlockReason = "";
+
+   if(InpUseATRFilter)
+     {
+      double atrBuf[1];
+      if(g_ATRHandle == INVALID_HANDLE || CopyBuffer(g_ATRHandle, 0, 1, 1, atrBuf) < 1)
+        {
+         g_FilterBlockReason = "ATR UNAVAIL";
+         g_FilterPassCache   = false;
+         g_FilterCacheValid  = true;
+         return;
+        }
+      g_CachedATRPips = atrBuf[0] / g_PipSize;
+      if(g_CachedATRPips < InpMinATRPips)
+        {
+         g_FilterBlockReason = StringFormat("LOW VOL ATR=%.1f", g_CachedATRPips);
+         g_FilterPassCache   = false;
+         g_FilterCacheValid  = true;
+         return;
+        }
+     }
+
+   if(InpUseADXFilter)
+     {
+      double adxBuf[1];
+      if(g_ADXHandle == INVALID_HANDLE || CopyBuffer(g_ADXHandle, 0, 1, 1, adxBuf) < 1)
+        {
+         g_FilterBlockReason = "ADX UNAVAIL";
+         g_FilterPassCache   = false;
+         g_FilterCacheValid  = true;
+         return;
+        }
+      g_CachedADX = adxBuf[0];
+      if(g_CachedADX < InpMinADX)
+        {
+         g_FilterBlockReason = StringFormat("RANGING ADX=%.1f", g_CachedADX);
+         g_FilterPassCache   = false;
+         g_FilterCacheValid  = true;
+         return;
+        }
+     }
+
+   g_FilterCacheValid = true;
+  }
+
+//+------------------------------------------------------------------+
+//|  MARKET FILTER — per-tick gate before order placement            |
+//|  InpFiltersEnabled = false → bypass everything, always returns   |
+//|  true. Session check uses pre-built bitmask (single bit-shift).  |
+//|  ATR/ADX read from bar-level cache — zero CopyBuffer per tick.   |
+//+------------------------------------------------------------------+
+bool IsMarketTradeable()
+  {
+   //--- Master switch: one bool check, bail immediately if filters disabled
+   if(!InpFiltersEnabled)
+      return true;
+
+   //--- Session bitmask check: (mask >> hour) & 1 — single CPU instruction
+   if(InpUseSessionFilter && !((g_SessionMask >> g_CurrentHour) & 1))
+     {
+      g_FilterBlockReason = StringFormat("OUT OF SESSION (%02d:xx)", g_CurrentHour);
+      return false;
+     }
+
+   //--- ATR + ADX: read from bar-level cache (set once per bar, never per tick)
+   if((InpUseATRFilter || InpUseADXFilter) && !g_FilterCacheValid)
+     {
+      g_FilterBlockReason = "FILTER WARMING UP";
+      return false;
+     }
+
+   if(!g_FilterPassCache)
+      return false;   // block reason already set in RecalcIndicatorCache()
+
+   g_FilterBlockReason = "";
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//|  STATE: IDLE — Place initial pending orders                      |
+//+------------------------------------------------------------------+
+void HandleIdleState()
+  {
+   //--- Safety net: never place a new straddle if a position or pending order
+   //    from this EA already exists (covers any edge case beyond reload recovery)
+   if(PositionExistsByMagic(POSITION_TYPE_BUY) || PositionExistsByMagic(POSITION_TYPE_SELL))
+     {
+      g_CycleState = STATE_TRADE_ACTIVE;
+      return;
+     }
+   if(OrderExistsByTicket(g_BuyStopTicket) || OrderExistsByTicket(g_SellStopTicket))
+     {
+      g_CycleState = STATE_PENDING;
+      return;
+     }
+
+   //--- Timeframe-lock: do NOT place new orders on a bar-open tick.
+   //    Wait for the market to settle before entering. New stradddles are only
+   //    placed on intra-bar ticks after a cycle has completed naturally.
+   if(g_NewBarOccurred)
+     {
+      if(InpVerboseLogging)
+         Print("New bar detected — skipping straddle placement this tick (timeframe-lock active).");
+      return;
+     }
+
+   //--- Volume & Ranging Filter: skip placement if market conditions are unfavourable
+   if(!IsMarketTradeable())
+     {
+      if(InpVerboseLogging)
+         Print("Market filter blocking entry: ", g_FilterBlockReason);
+      return;   // Will retry next tick — no state change, orders held off
+     }
+
+   if(InpVerboseLogging)
+      Print("Cycle starting — placing straddle orders...");
+   if(PlaceStraddleOrders())
+     {
+      g_CycleState = STATE_PENDING;
+      if(InpVerboseLogging)
+         Print("Straddle placed. Buy Stop: ", g_BuyStopTicket,
+               " | Sell Stop: ", g_SellStopTicket);
+     }
+   else
+     {
+      if(InpVerboseLogging)
+         Print("Failed to place straddle orders. Will retry next tick.");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|  STATE: PENDING — Monitor which order activates                  |
+//+------------------------------------------------------------------+
+void HandlePendingState()
+  {
+   bool buyActive  = PositionExistsByMagic(POSITION_TYPE_BUY);
+   bool sellActive = PositionExistsByMagic(POSITION_TYPE_SELL);
+
+   //--- Validate pending orders still exist (in case of external close)
+   bool buyPending  = OrderExistsByTicket(g_BuyStopTicket);
+   bool sellPending = OrderExistsByTicket(g_SellStopTicket);
+
+   //--- Buy Stop activated
+   if(buyActive && !sellActive)
+     {
+      if(InpVerboseLogging)
+         Print("BUY STOP activated. Deleting Sell Stop order...");
+      if(sellPending) DeleteOrder(g_SellStopTicket);
+      //--- Cache ticket for O(1) SelectByTicket in TrailStopLoss
+      if(PositionInfo.SelectByMagic(g_Symbol, MAGIC_NUMBER))
+         g_ActivePositionTicket = PositionInfo.Ticket();
+      g_CycleState = STATE_TRADE_ACTIVE;
+     }
+   else if(sellActive && !buyActive)
+     {
+      if(InpVerboseLogging)
+         Print("SELL STOP activated. Deleting Buy Stop order...");
+      if(buyPending) DeleteOrder(g_BuyStopTicket);
+      //--- Cache ticket for O(1) SelectByTicket in TrailStopLoss
+      if(PositionInfo.SelectByMagic(g_Symbol, MAGIC_NUMBER))
+         g_ActivePositionTicket = PositionInfo.Ticket();
+      g_CycleState = STATE_TRADE_ACTIVE;
+     }
+
+   //--- Both orders deleted externally (edge case)
+   else if(!buyPending && !sellPending && !buyActive && !sellActive)
+     {
+      Print("Warning: Both orders lost externally. Restarting cycle.");
+      g_BuyStopTicket  = 0;
+      g_SellStopTicket = 0;
+      g_CycleState     = STATE_IDLE;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|  STATE: TRADE ACTIVE — Trail stop loss on open position          |
+//+------------------------------------------------------------------+
+void HandleActiveTradeState()
+  {
+   //--- Check if position is still open
+   bool buyActive  = PositionExistsByMagic(POSITION_TYPE_BUY);
+   bool sellActive = PositionExistsByMagic(POSITION_TYPE_SELL);
+
+   if(!buyActive && !sellActive)
+     {
+      //--- Trade closed (TP or SL hit) — cycle done
+      if(InpVerboseLogging)
+         Print("Position closed (TP/SL). Moving to CYCLE_DONE state.");
+      g_CycleState = STATE_CYCLE_DONE;
+      return;
+     }
+
+   //--- Trail the active position
+   if(buyActive)
+      TrailStopLoss(POSITION_TYPE_BUY);
+   else if(sellActive)
+      TrailStopLoss(POSITION_TYPE_SELL);
+  }
+
+//+------------------------------------------------------------------+
+//|  STATE: CYCLE DONE — Reset and restart straddle                  |
+//+------------------------------------------------------------------+
+void HandleCycleDoneState()
+  {
+   Print("Cycle complete. Resetting tickets and restarting straddle...");
+   g_BuyStopTicket        = 0;
+   g_SellStopTicket       = 0;
+   g_ActivePositionTicket = 0;
+   g_CycleState           = STATE_IDLE;
+  }
+
+//+------------------------------------------------------------------+
+//|  PLACE STRADDLE ORDERS                                           |
+//|  Buy Stop 30 pips above + Sell Stop 30 pips below current price |
+//|  SL = 60 pips from entry | TP = 60 pips from entry              |
+//+------------------------------------------------------------------+
+bool PlaceStraddleOrders()
+  {
+   double entryOffset = InpEntryPips      * g_PipSize;
+   double slOffset    = InpStopLossPips   * g_PipSize;
+   double tpOffset    = InpTakeProfitPips * g_PipSize;
+
+   //--- Use per-tick cached bid/ask (already fetched at top of OnTick)
+   double buyEntry  = NormalizeDouble(g_Ask + entryOffset, g_Digits);
+   double buySL     = NormalizeDouble(buyEntry - slOffset,  g_Digits);
+   double buyTP     = NormalizeDouble(buyEntry + tpOffset,  g_Digits);
+
+   double sellEntry = NormalizeDouble(g_Bid - entryOffset, g_Digits);
+   double sellSL    = NormalizeDouble(sellEntry + slOffset, g_Digits);
+   double sellTP    = NormalizeDouble(sellEntry - tpOffset, g_Digits);
+
+   //--- Validate minimum distance against broker stop level
+   long   stopLevel = SymbolInfoInteger(g_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist   = stopLevel * SymbolInfoDouble(g_Symbol, SYMBOL_POINT);
+   if(entryOffset < minDist)
+     {
+      Print("Entry offset too small for broker stop level. Adjust InpEntryPips.");
+      return false;
+     }
+
+   bool buyPlaced = Trade.BuyStop(InpLotSize, buyEntry, g_Symbol, buySL, buyTP,
+                                   ORDER_TIME_GTC, 0, "VENOM AI_BuyStop");
+   if(buyPlaced)
+     {
+      g_BuyStopTicket = Trade.ResultOrder();
+      if(InpVerboseLogging)
+         Print("BuyStop placed → Entry:", buyEntry, " SL:", buySL, " TP:", buyTP);
+     }
+   else
+     {
+      Print("BuyStop placement failed: ", Trade.ResultRetcodeDescription());
+      return false;
+     }
+
+   bool sellPlaced = Trade.SellStop(InpLotSize, sellEntry, g_Symbol, sellSL, sellTP,
+                                     ORDER_TIME_GTC, 0, "VENOM AI_SellStop");
+   if(sellPlaced)
+     {
+      g_SellStopTicket = Trade.ResultOrder();
+      if(InpVerboseLogging)
+         Print("SellStop placed → Entry:", sellEntry, " SL:", sellSL, " TP:", sellTP);
+     }
+   else
+     {
+      Print("SellStop placement failed: ", Trade.ResultRetcodeDescription());
+      if(g_BuyStopTicket > 0) DeleteOrder(g_BuyStopTicket);
+      g_BuyStopTicket = 0;
+      return false;
+     }
+
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//|  TRAIL STOP LOSS                                                 |
+//|  Phase 1: first tick price moves our way → snap SL to 10 pips   |
+//|  Phase 2: every subsequent tick → trail at InpTrailStepPips      |
+//|  Gate: priceMoveProfit > 0 (any favourable movement), NOT        |
+//|  waiting for posProfit > 0 (which is delayed by the spread).     |
+//+------------------------------------------------------------------+
+void TrailStopLoss(ENUM_POSITION_TYPE posType)
+  {
+   if(g_ActivePositionTicket == 0 || !PositionInfo.SelectByTicket(g_ActivePositionTicket))
+      return;
+   if(PositionInfo.PositionType() != posType)
+      return;
+
+   double openPrice = PositionInfo.PriceOpen();
+   double currentSL = PositionInfo.StopLoss();
+   double posProfit = PositionInfo.Profit();   // verbose log only
+   double newSL     = 0.0;
+
+   if(posType == POSITION_TYPE_BUY)
+     {
+      double move = g_Bid - openPrice;
+      if(move <= 0) return;   // no favourable movement yet — do not touch SL
+
+      //--- Phase 1: snap SL to 10 pips below current bid
+      double snapSL  = NormalizeDouble(g_Bid - g_SnapDistance, g_Digits);
+      //--- Phase 2: trail at user-defined step — take whichever is higher (tighter)
+      double trailSL = NormalizeDouble(g_Bid - g_TrailStep, g_Digits);
+      newSL = MathMax(snapSL, trailSL);
+      if(newSL <= currentSL) return;   // never loosen the SL
+     }
+   else if(posType == POSITION_TYPE_SELL)
+     {
+      double move = openPrice - g_Ask;
+      if(move <= 0) return;
+
+      double snapSL  = NormalizeDouble(g_Ask + g_SnapDistance, g_Digits);
+      double trailSL = NormalizeDouble(g_Ask + g_TrailStep,    g_Digits);
+      newSL = MathMin(snapSL, trailSL);
+      if(currentSL > 0 && newSL >= currentSL) return;
+     }
+
+   if(!Trade.PositionModify(g_ActivePositionTicket, newSL, PositionInfo.TakeProfit()))
+      Print("TrailSL modify failed: ", Trade.ResultRetcodeDescription(),
+            " | Ticket:", g_ActivePositionTicket, " | NewSL:", newSL);
+   else if(InpVerboseLogging)
+      Print("Trail SL → ", newSL, " | P&L: $", DoubleToString(posProfit, 2));
+  }
+
+//+------------------------------------------------------------------+
+//|  DELETE PENDING ORDER BY TICKET                                  |
+//+------------------------------------------------------------------+
+void DeleteOrder(ulong ticket)
+  {
+   if(ticket == 0)
+      return;
+
+   if(!Trade.OrderDelete(ticket))
+      Print("Order delete failed: ", Trade.ResultRetcodeDescription(),
+            " | Ticket: ", ticket);
+   else if(InpVerboseLogging)
+      Print("Order deleted successfully. Ticket: ", ticket);
+  }
+
+//+------------------------------------------------------------------+
+//|  STOP ALGORITHM — Cancel pending orders, keep active positions   |
+//+------------------------------------------------------------------+
+void StopAlgorithm()
+  {
+   g_AlgoRunning = false;
+
+   //--- Cancel any remaining pending orders from this EA
+   if(g_BuyStopTicket > 0 && OrderExistsByTicket(g_BuyStopTicket))
+      DeleteOrder(g_BuyStopTicket);
+
+   if(g_SellStopTicket > 0 && OrderExistsByTicket(g_SellStopTicket))
+      DeleteOrder(g_SellStopTicket);
+
+   g_BuyStopTicket        = 0;
+   g_SellStopTicket       = 0;
+   g_ActivePositionTicket = 0;
+   g_CycleState           = STATE_IDLE;
+
+   Print("Algorithm STOPPED by user. Open positions remain open.");
+   UpdateDashboardStatus("STOPPED", clrOrangeRed);
+  }
+
+//+------------------------------------------------------------------+
+//|  HELPER: Check if a position of given type exists for this EA    |
+//+------------------------------------------------------------------+
+bool PositionExistsByMagic(ENUM_POSITION_TYPE posType)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(PositionInfo.SelectByIndex(i))
+        {
+         if(PositionInfo.Symbol() == g_Symbol        &&
+            PositionInfo.Magic()    == MAGIC_NUMBER     &&
+            PositionInfo.PositionType() == posType)
+            return true;
+        }
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//|  HELPER: Check if a pending order exists by ticket               |
+//+------------------------------------------------------------------+
+bool OrderExistsByTicket(ulong ticket)
+  {
+   if(ticket == 0)
+      return false;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(OrderInfo.SelectByIndex(i))
+        {
+         if(OrderInfo.Ticket() == ticket)
+            return true;
+        }
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//|  DASHBOARD: Build UI Buttons and Labels                          |
+//+------------------------------------------------------------------+
+void BuildDashboard()
+  {
+   long chart = ChartID();
+   int  corner = CORNER_LEFT_UPPER;
+   int  x = 15, y = 20;
+
+   //--- Panel background
+   ObjectCreate(chart, "PANEL_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(chart, "PANEL_BG", OBJPROP_XDISTANCE, x - 5);
+   ObjectSetInteger(chart, "PANEL_BG", OBJPROP_YDISTANCE, y - 5);
+   ObjectSetInteger(chart, "PANEL_BG", OBJPROP_XSIZE, 240);
+   ObjectSetInteger(chart, "PANEL_BG", OBJPROP_YSIZE, 205);   // Extra row for filter status
+   ObjectSetInteger(chart, "PANEL_BG", OBJPROP_BGCOLOR, C'255,255,255');
+   ObjectSetInteger(chart, "PANEL_BG", OBJPROP_BORDER_COLOR, C'60,60,80');
+   ObjectSetInteger(chart, "PANEL_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(chart, "PANEL_BG", OBJPROP_CORNER, corner);
+   ObjectSetInteger(chart, "PANEL_BG", OBJPROP_BACK, false);
+
+   //--- Title label
+   CreateLabel("LBL_TITLE", "⚡ VENOM AI_v3.2", x + 5, y + 5,
+               clrGold, 10, "Arial Bold", corner);
+
+   //--- Status label
+   CreateLabel(LBL_STATUS, "● IDLE", x + 5, y + 28,
+               clrSilver, 9, "Arial", corner);
+
+   //--- Info label
+   CreateLabel(LBL_INFO, "Lot: " + DoubleToString(InpLotSize, 2), x + 5, y + 48,
+               clrSilver, 8, "Arial", corner);
+
+   //--- Risk info label
+   CreateLabel("LBL_RISK", "Risk: -" + DoubleToString(InpDailyLossLimit, 1) +
+               "% / +" + DoubleToString(InpDailyProfitTarget, 1) + "%",
+               x + 5, y + 68, clrSilver, 8, "Arial", corner);
+
+   //--- Daily P&L label
+   CreateLabel("LBL_PNL", "Daily P&L: $0.00 (0.00%)", x + 5, y + 85,
+               clrSilver, 8, "Arial", corner);
+
+   //--- Filter status label (shows which filter is blocking, or "FILTERS: OK" when clear)
+   CreateLabel("LBL_FILTER", "FILTERS: OK", x + 5, y + 102,
+               clrLimeGreen, 8, "Arial", corner);
+
+   //--- START button
+   CreateButton(BTN_START, "▶  START", x + 5, y + 122, 105, 28,
+                clrWhite, C'0,120,60', corner);
+
+   //--- STOP button
+   CreateButton(BTN_STOP, "■  STOP", x + 120, y + 122, 105, 28,
+                clrWhite, C'160,30,30', corner);
+
+   ChartRedraw(chart);
+  }
+
+//+------------------------------------------------------------------+
+//|  DASHBOARD: Remove all UI objects                                |
+//+------------------------------------------------------------------+
+void RemoveDashboard()
+  {
+   string objects[] = {"PANEL_BG","LBL_TITLE",LBL_STATUS,LBL_INFO,"LBL_RISK","LBL_PNL","LBL_FILTER",BTN_START,BTN_STOP};
+   for(int i = 0; i < ArraySize(objects); i++)
+      ObjectDelete(ChartID(), objects[i]);
+
+   ChartRedraw(ChartID());
+  }
+
+//+------------------------------------------------------------------+
+//|  DASHBOARD: Update status label                                  |
+//+------------------------------------------------------------------+
+void UpdateDashboardStatus(string text, color clr)
+  {
+   ObjectSetString(ChartID(), LBL_STATUS, OBJPROP_TEXT, "● " + text);
+   ObjectSetInteger(ChartID(), LBL_STATUS, OBJPROP_COLOR, clr);
+   ChartRedraw(ChartID());
+  }
+
+//+------------------------------------------------------------------+
+//|  DASHBOARD: Update info line with live state details             |
+//+------------------------------------------------------------------+
+void UpdateDashboardInfo()
+  {
+   string stateStr = "";
+
+   switch(g_CycleState)
+     {
+      case STATE_IDLE:         stateStr = "IDLE";         break;
+      case STATE_PENDING:      stateStr = "PENDING";      break;
+      case STATE_TRADE_ACTIVE: stateStr = "TRADE ACTIVE"; break;
+      case STATE_CYCLE_DONE:   stateStr = "CYCLE DONE";   break;
+     }
+
+   string info = "Lot:" + DoubleToString(InpLotSize, 2) +
+                 " | " + stateStr;
+
+   ObjectSetString(ChartID(), LBL_INFO, OBJPROP_TEXT, info);
+
+   //--- Update live daily P&L display
+   if(g_DayStartBalance > 0)
+     {
+      double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
+      double dailyPnL = equity - g_DayStartBalance;
+      double pnlPct   = (dailyPnL / g_DayStartBalance) * 100.0;
+      color  pnlColor = (dailyPnL >= 0) ? clrLimeGreen : clrOrangeRed;
+      string pnlText  = StringFormat("Daily P&L: $%.2f (%.2f%%)", dailyPnL, pnlPct);
+      ObjectSetString (ChartID(), "LBL_PNL", OBJPROP_TEXT,  pnlText);
+      ObjectSetInteger(ChartID(), "LBL_PNL", OBJPROP_COLOR, pnlColor);
+     }
+
+   //--- Update filter status label (only meaningful while idle/waiting to place)
+   if(g_CycleState == STATE_IDLE && g_FilterBlockReason != "")
+     {
+      ObjectSetString (ChartID(), "LBL_FILTER", OBJPROP_TEXT,  "⚠ " + g_FilterBlockReason);
+      ObjectSetInteger(ChartID(), "LBL_FILTER", OBJPROP_COLOR, clrOrange);
+     }
+   else
+     {
+      ObjectSetString (ChartID(), "LBL_FILTER", OBJPROP_TEXT,  "FILTERS: OK");
+      ObjectSetInteger(ChartID(), "LBL_FILTER", OBJPROP_COLOR, clrLimeGreen);
+     }
+
+   ChartRedraw(ChartID());
+  }
+
+//+------------------------------------------------------------------+
+//|  HELPER: Create a text label on the chart                        |
+//+------------------------------------------------------------------+
+void CreateLabel(string name, string text, int x, int y,
+                 color clr, int fontSize, string font, int corner)
+  {
+   ObjectCreate(ChartID(), name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(ChartID(), name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(ChartID(), name, OBJPROP_YDISTANCE, y);
+   ObjectSetString (ChartID(), name, OBJPROP_TEXT, text);
+   ObjectSetInteger(ChartID(), name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(ChartID(), name, OBJPROP_FONTSIZE, fontSize);
+   ObjectSetString (ChartID(), name, OBJPROP_FONT, font);
+   ObjectSetInteger(ChartID(), name, OBJPROP_CORNER, corner);
+   ObjectSetInteger(ChartID(), name, OBJPROP_BACK, false);
+   ObjectSetInteger(ChartID(), name, OBJPROP_SELECTABLE, false);
+  }
+
+//+------------------------------------------------------------------+
+//|  HELPER: Create a clickable button on the chart                  |
+//+------------------------------------------------------------------+
+void CreateButton(string name, string text, int x, int y,
+                  int width, int height, color textClr,
+                  color bgClr, int corner)
+  {
+   ObjectCreate(ChartID(), name, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(ChartID(), name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(ChartID(), name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(ChartID(), name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(ChartID(), name, OBJPROP_YSIZE, height);
+   ObjectSetString (ChartID(), name, OBJPROP_TEXT, text);
+   ObjectSetInteger(ChartID(), name, OBJPROP_COLOR, textClr);
+   ObjectSetInteger(ChartID(), name, OBJPROP_BGCOLOR, bgClr);
+   ObjectSetInteger(ChartID(), name, OBJPROP_BORDER_COLOR, clrNONE);
+   ObjectSetInteger(ChartID(), name, OBJPROP_FONTSIZE, 9);
+   ObjectSetString (ChartID(), name, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(ChartID(), name, OBJPROP_CORNER, corner);
+   ObjectSetInteger(ChartID(), name, OBJPROP_BACK, false);
+   ObjectSetInteger(ChartID(), name, OBJPROP_SELECTABLE, false);
+  }
+
+//+------------------------------------------------------------------+
+//|  END OF EXPERT ADVISOR                                           |
+//+------------------------------------------------------------------+
